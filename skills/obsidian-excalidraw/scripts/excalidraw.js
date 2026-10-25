@@ -56,11 +56,14 @@ const USAGE = `Usage: node excalidraw.js <command> ...
                                    Replace a drawing's elements with an edited scene
                                    (from read --json). Repairs bindings and Text Elements.
                                    --reroute redraws straight bound arrows after moving shapes.
+  render <file> [--out PNG] [--region X,Y,W,H] [--scale N]
+                                   Draw the drawing to a PNG with Excalidraw itself (headless Chrome/Edge,
+                                   Node 22+, internet), so you can look at it. --region zooms into part.
   compress <file> | decompress <file>
                                    Switch a drawing's storage between compressed and plain JSON.
   open <file>                      Open any vault file in the Obsidian app.
 
-Spec: { "title", "direction": "LR"|"TB",
+Spec: { "title", "direction": "LR"|"TB", "layout": "layers"|"mindmap", "root" (mindmap centre id),
         "nodes":  [{ "id", "label", "shape": "rectangle"|"ellipse"|"diamond", "color",
                      "stroke", "style", "rank", "x", "y", "width", "height", "fontSize", "link" }],
         "edges":  [{ "from", "to", "label", "style": "solid"|"dashed"|"dotted", "both", "arrow", "color" }],
@@ -168,13 +171,19 @@ function boundaryPoint(el, dx, dy, gap) {
   return { x: cx + dx * t + (dx / len) * gap, y: cy + dy * t + (dy / len) * gap };
 }
 
-// Straight segment between the outlines of a and b, or null when their centres coincide.
+// Straight segment between a and b, or null when their centres coincide. Shapes side by side connect
+// edge-middle to edge-middle (so steep lines don't slice through neighbouring boxes); stacked shapes connect
+// bottom to top; overlapping ones fall back to a centre-to-centre line clipped at both outlines.
 function segment(a, b) {
-  const dx = b.x + b.width / 2 - (a.x + a.width / 2);
-  const dy = b.y + b.height / 2 - (a.y + a.height / 2);
+  const acx = a.x + a.width / 2, acy = a.y + a.height / 2, bcx = b.x + b.width / 2, bcy = b.y + b.height / 2;
+  const dx = bcx - acx, dy = bcy - acy;
   if (!dx && !dy) return null;
-  const p1 = boundaryPoint(a, dx, dy, ARROW_GAP);
-  const p2 = boundaryPoint(b, -dx, -dy, ARROW_GAP);
+  let p1, p2;
+  if (a.x + a.width + 2 * ARROW_GAP < b.x) [p1, p2] = [{ x: a.x + a.width + ARROW_GAP, y: acy }, { x: b.x - ARROW_GAP, y: bcy }];
+  else if (b.x + b.width + 2 * ARROW_GAP < a.x) [p1, p2] = [{ x: a.x - ARROW_GAP, y: acy }, { x: b.x + b.width + ARROW_GAP, y: bcy }];
+  else if (a.y + a.height + 2 * ARROW_GAP < b.y) [p1, p2] = [{ x: acx, y: a.y + a.height + ARROW_GAP }, { x: bcx, y: b.y - ARROW_GAP }];
+  else if (b.y + b.height + 2 * ARROW_GAP < a.y) [p1, p2] = [{ x: acx, y: a.y - ARROW_GAP }, { x: bcx, y: b.y + b.height + ARROW_GAP }];
+  else [p1, p2] = [boundaryPoint(a, dx, dy, ARROW_GAP), boundaryPoint(b, -dx, -dy, ARROW_GAP)];
   return {
     x: p1.x, y: p1.y, width: Math.abs(p2.x - p1.x), height: Math.abs(p2.y - p1.y),
     points: [[0, 0], [p2.x - p1.x, p2.y - p1.y]],
@@ -225,6 +234,7 @@ function layoutSpec(spec) {
     if (byId.has(n.id)) fail(`duplicate node id "${n.id}"`);
     byId.set(n.id, n);
   }
+  if (spec.layout === "mindmap") return mindmapLayout(spec, nodes, byId);
 
   const groupOf = new Map();
   (spec.groups || []).forEach((g, gi) => (g.nodes || []).forEach((id) => groupOf.has(id) || groupOf.set(id, gi)));
@@ -325,6 +335,70 @@ function layoutSpec(spec) {
   return nodes;
 }
 
+// Two-sided mind map: the root in the middle, its children split between right and left so both sides
+// are about as tall, every subtree stacked in columns by depth and centred on its own children.
+function mindmapLayout(spec, nodes, byId) {
+  const gapX = spec.spacing?.rank ?? 110, gapY = spec.spacing?.node ?? 18, gapBranch = 40;
+  const root = byId.get(spec.root) || nodes[0];
+  const children = new Map(nodes.map((n) => [n.id, []]));
+  const seen = new Set([root.id]);
+  const queue = [root];
+  while (queue.length) {
+    const n = queue.shift();
+    for (const e of spec.edges || []) {
+      const other = e.from === n.id ? e.to : e.to === n.id ? e.from : null;
+      if (other && byId.has(other) && !seen.has(other)) {
+        seen.add(other);
+        children.get(n.id).push(byId.get(other));
+        queue.push(byId.get(other));
+      }
+    }
+  }
+  const height = (n) => {
+    const kids = children.get(n.id);
+    if (!kids.length) return n.h;
+    return Math.max(n.h, kids.reduce((s, k) => s + height(k), 0) + (kids.length - 1) * (n === root ? gapBranch : gapY));
+  };
+
+  // Balance the sides by subtree height, keeping the branch order.
+  const branches = children.get(root.id);
+  const total = branches.reduce((s, b) => s + height(b), 0);
+  let acc = 0;
+  const right = [], left = [];
+  for (const b of branches) (acc + height(b) / 2 <= total / 2 || !right.length ? right : left).push(b), acc += height(b);
+
+  const colWidth = []; // widest node at each depth, over both sides
+  const measureDepth = (n, d) => {
+    colWidth[d] = Math.max(colWidth[d] || 0, n.w);
+    children.get(n.id).forEach((k) => measureDepth(k, d + 1));
+  };
+  branches.forEach((b) => measureDepth(b, 1));
+
+  const place = (n, d, top, dir) => {
+    if (!n.width) n.w = colWidth[d]; // one width per column reads tidier
+    let x = root.w / 2 + gapX;
+    for (let i = 1; i < d; i++) x += colWidth[i] + gapX;
+    n.px = dir > 0 ? x : -x - n.w;
+    const kids = children.get(n.id);
+    const h = height(n);
+    n.py = top + (h - n.h) / 2;
+    let y = top + (h - (kids.reduce((s, k) => s + height(k), 0) + (kids.length - 1) * gapY)) / 2;
+    for (const k of kids) { place(k, d + 1, y, dir); y += height(k) + gapY; }
+  };
+  for (const [side, dir] of [[right, 1], [left, -1]]) {
+    const sideH = side.reduce((s, b) => s + height(b), 0) + Math.max(0, side.length - 1) * gapBranch;
+    let y = -sideH / 2;
+    for (const b of side) { place(b, 1, y, dir); y += height(b) + gapBranch; }
+  }
+  [root.px, root.py] = [-root.w / 2, -root.h / 2];
+  for (const n of nodes) {
+    if (!seen.has(n.id)) fail(`mindmap: node "${n.id}" is not connected to the root "${root.id}"`);
+    n.manual = n.x != null && n.y != null;
+    if (n.manual) [n.px, n.py] = [n.x, n.y];
+  }
+  return nodes;
+}
+
 function bbox(els) {
   const live = els.filter((e) => !e.isDeleted);
   if (!live.length) return null;
@@ -369,7 +443,7 @@ function buildElements(spec, nodes, external = () => null) {
 
   for (const e of spec.edges || []) {
     const a = resolve(e.from, "edge endpoint"), b = resolve(e.to, "edge endpoint");
-    const arrow = a !== b && arrowBetween(a, b, e);
+    const arrow = a !== b && arrowBetween(a, b, spec.layout === "mindmap" && e.arrow == null ? { ...e, arrow: false } : e);
     if (!arrow) { console.error(`skipped edge ${e.from} -> ${e.to}: self loop or overlapping shapes`); continue; }
     edgeEls.push(arrow);
     if (e.label) edgeEls.push(boundText(arrow, String(e.label), e.fontSize || 16));
@@ -534,6 +608,146 @@ function summarize(file, data, compressed) {
   return out.join("\n");
 }
 
+// ---------- render to PNG ----------
+
+// Excalidraw's own exporter draws the scene in a headless Chrome/Edge that the script drives over the
+// DevTools protocol, so the screenshot waits until drawing has really finished. No install needed beyond the
+// browser; the page loads Excalidraw from esm.sh, so rendering needs internet access.
+const EXCALIDRAW_ESM = "https://esm.sh/@excalidraw/excalidraw@0.18.0?bundle";
+const MAX_RENDER_PX = 4000;
+
+function findBrowser() {
+  const env = process.env.CHROME_PATH || process.env.BROWSER_PATH;
+  if (env) return env;
+  const candidates = process.platform === "win32"
+    ? [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.LOCALAPPDATA].filter(Boolean).flatMap((base) => [
+      path.join(base, "Google", "Chrome", "Application", "chrome.exe"),
+      path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"),
+      path.join(base, "Chromium", "Application", "chrome.exe")])
+    : process.platform === "darwin"
+      ? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium"]
+      : ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser",
+        "/snap/bin/chromium", "/usr/bin/microsoft-edge"];
+  return candidates.find((p) => fs.existsSync(p))
+    || fail("no Chrome, Edge or Chromium found; set CHROME_PATH to a Chromium-based browser");
+}
+
+// Minimal DevTools protocol client over Node's built-in WebSocket.
+function devtools(url) {
+  const ws = new WebSocket(url);
+  const pending = new Map();
+  let next = 0;
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    const p = msg.id && pending.get(msg.id);
+    if (!p) return;
+    pending.delete(msg.id);
+    if (msg.error) p.reject(new Error(msg.error.message));
+    else p.resolve(msg.result);
+  };
+  const opened = new Promise((resolve, reject) => {
+    ws.onopen = resolve;
+    ws.onerror = () => reject(new Error(`could not connect to the browser at ${url}`));
+  });
+  const send = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = ++next;
+    pending.set(id, { resolve, reject });
+    ws.send(JSON.stringify({ id, method, params }));
+  });
+  return { opened, send, close: () => ws.close() };
+}
+
+function renderPage(scene) {
+  return `<!doctype html><html><head><meta charset="utf-8">
+<style>html,body{margin:0;background:#fff}svg{display:block}</style></head><body>
+<script type="module">
+const scene = ${JSON.stringify(scene).replace(/</g, "\\u003c")};
+try {
+  const { exportToSvg } = await import(${JSON.stringify(EXCALIDRAW_ESM)});
+  const svg = await exportToSvg({
+    elements: scene.elements, files: scene.files,
+    appState: { ...scene.appState, exportBackground: true, viewBackgroundColor: "#ffffff", exportWithDarkMode: false, exportPadding: 20 },
+  });
+  document.body.appendChild(svg);
+  document.title = "READY " + Math.ceil(parseFloat(svg.getAttribute("width"))) + " " + Math.ceil(parseFloat(svg.getAttribute("height")));
+} catch (e) {
+  document.body.textContent = String(e && e.stack || e);
+  document.title = "ERROR";
+}
+</script></body></html>`;
+}
+
+// Elements inside a region, plus the labels of containers that are in it.
+function inRegion(elements, region) {
+  const [rx, ry, rw, rh] = region.split(",").map(Number);
+  if ([rx, ry, rw, rh].some((n) => !Number.isFinite(n))) fail("--region must be X,Y,W,H");
+  const hits = new Set(elements.filter((e) => e.x < rx + rw && e.x + e.width > rx && e.y < ry + rh && e.y + e.height > ry).map((e) => e.id));
+  return elements.filter((e) => hits.has(e.id) || (e.containerId && hits.has(e.containerId)));
+}
+
+async function cmdRender(file, flags) {
+  if (typeof WebSocket === "undefined") fail("render needs Node.js 22 or later (for its built-in WebSocket)");
+  const { data } = loadDrawing(file);
+  let elements = data.elements.filter((e) => !e.isDeleted);
+  if (flags.region) elements = inRegion(elements, flags.region);
+  if (!elements.length) fail("nothing to render (no elements" + (flags.region ? " in that region)" : ")"));
+
+  const tmp = path.join(require("os").tmpdir(), "obsidian-kit-render");
+  fs.mkdirSync(tmp, { recursive: true });
+  const page = path.join(tmp, "page.html");
+  fs.writeFileSync(page, renderPage({ elements, appState: data.appState || {}, files: data.files || {} }), "utf8");
+  const out = path.resolve(flags.out || path.join(tmp, path.basename(file).replace(/\.excalidraw(\.md)?$/, "") + ".png"));
+
+  const browser = require("child_process").spawn(findBrowser(), [
+    "--headless=new", "--disable-gpu", "--hide-scrollbars", "--no-first-run", "--no-default-browser-check",
+    `--user-data-dir=${path.join(tmp, "profile")}`, "--remote-debugging-port=0", "about:blank",
+  ], { stdio: ["ignore", "ignore", "pipe"] });
+  const timer = setTimeout(() => browser.kill(), 120000);
+  try {
+    const endpoint = await new Promise((resolve, reject) => {
+      let log = "";
+      browser.stderr.on("data", (d) => {
+        log += d;
+        const m = log.match(/DevTools listening on (ws:\/\/\S+)/);
+        if (m) resolve(m[1]);
+      });
+      browser.on("exit", (code) => reject(new Error(`browser exited (${code}) before it was ready:\n${log.slice(-500)}`)));
+    });
+    const port = new URL(endpoint).port;
+    const target = (await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()).find((t) => t.type === "page");
+    const tab = devtools(target.webSocketDebuggerUrl);
+    await tab.opened;
+
+    const box = bbox(elements);
+    const fit = (w, h) => Math.min(Number(flags.scale) || 1.5, MAX_RENDER_PX / Math.max(w, h));
+    const metrics = (w, h) => tab.send("Emulation.setDeviceMetricsOverride", { width: w, height: h, deviceScaleFactor: fit(w, h), mobile: false });
+    await metrics(Math.ceil(box.maxX - box.minX + 40), Math.ceil(box.maxY - box.minY + 40));
+    await tab.send("Page.navigate", { url: "file:///" + page.split(path.sep).join("/") });
+
+    let title = "";
+    for (const start = Date.now(); !/^(READY|ERROR)/.test(title); await new Promise((r) => setTimeout(r, 250))) {
+      if (Date.now() - start > 90000) fail("timed out waiting for Excalidraw to draw (is there internet access to esm.sh?)");
+      title = (await tab.send("Runtime.evaluate", { expression: "document.title", returnByValue: true })).result.value || "";
+    }
+    if (title === "ERROR") {
+      const msg = (await tab.send("Runtime.evaluate", { expression: "document.body.textContent", returnByValue: true })).result.value;
+      fail(`Excalidraw could not draw this scene:\n${msg}`);
+    }
+    const [, w, h] = title.split(" ").map(Number);
+    await metrics(w, h);
+    const shot = await tab.send("Page.captureScreenshot", { format: "png", clip: { x: 0, y: 0, width: w, height: h, scale: 1 } });
+    fs.writeFileSync(out, Buffer.from(shot.data, "base64"));
+    tab.close();
+    const scale = fit(w, h);
+    console.log(`rendered ${out} (${Math.round(w * scale)}x${Math.round(h * scale)} px, scale ${scale.toFixed(2)}`
+      + `, canvas origin ${r(box.minX - 20)},${r(box.minY - 20)})`);
+  } finally {
+    clearTimeout(timer);
+    browser.kill();
+  }
+}
+
 // ---------- commands ----------
 
 function cmdCreate(specFile, outFile, flags) {
@@ -617,7 +831,7 @@ function main() {
   const args = process.argv.slice(2);
   const flags = {}, pos = [];
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--at") flags.at = args[++i];
+    if (["--at", "--out", "--region", "--scale"].includes(args[i])) flags[args[i].slice(2)] = args[++i];
     else if (args[i].startsWith("--")) flags[args[i].slice(2)] = true;
     else pos.push(args[i]);
   }
@@ -635,8 +849,9 @@ function main() {
     const { md, data } = loadDrawing(a);
     saveDrawing(a, md, data, cmd === "compress");
     console.log(`${cmd}ed ${a}`);
-  } else if (cmd === "open") cmdOpen(a);
+  } else if (cmd === "render") return cmdRender(a, flags);
+  else if (cmd === "open") cmdOpen(a);
   else fail(`unknown command "${cmd}"\n\n${USAGE}`);
 }
 
-try { main(); } catch (e) { console.error("error: " + e.message); process.exit(1); }
+Promise.resolve().then(main).catch((e) => { console.error("error: " + e.message); process.exit(1); });

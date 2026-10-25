@@ -5,7 +5,8 @@ description: Create, read, explain and edit Excalidraw drawings (.excalidraw.md)
 
 # Excalidraw drawings in Obsidian
 
-Needs the Obsidian **Excalidraw** community plugin (by Zsolt Viczian) in the vault, and Node.js.
+Needs the Obsidian **Excalidraw** community plugin (by Zsolt Viczian) in the vault, and Node.js
+(22+ for `render`, which also needs Chrome, Edge or Chromium and internet access).
 To find the vault, follow "Find the vault first" in the obsidian-notes skill
 (`node "${CLAUDE_PLUGIN_ROOT}/skills/obsidian-notes/scripts/obsidian.js" vaults`).
 
@@ -18,17 +19,20 @@ Always go through the tool, which handles both, plus arrow bindings and z-order.
 ## Read / explain a drawing
 - `read <file>` → boxes with labels and ids, what is inside what, every arrow as `A --> B` with its label, free text.
   This is usually enough to explain or reason about a diagram.
+- `render <file>` → a PNG of the drawing exactly as Excalidraw draws it; Read the PNG to *see* it (layout, hand-drawn
+  parts, images). `--region X,Y,W,H` zooms into part of a big canvas.
 - `read <file> --json` → the full scene (exact coordinates, colours) when you need precise detail.
 - Arrows marked `(near, unbound)` were drawn next to a box without snapping to it; treat them as connected.
 
 ## Create a diagram
 1. Get the content: read the note(s) the user points at ("based on this") or use the conversation.
-2. Design before drawing: list the **components** (nodes), the **interactions** (edges, labelled with the verb,
-   protocol or event), and the **boundaries** (groups: VPC, "Backend services", a bounded context).
-   Aim for 4–15 nodes; split bigger systems into several diagrams or levels.
+2. Design before drawing, following the **excalidraw-design** skill: the diagram's one job, the shape that fits it
+   (layers, mind map, pipeline, ...), then the **components** (nodes), the **interactions** (edges, labelled with the
+   verb, protocol or event), and the **boundaries** (groups). Aim for 4–15 nodes in a flow, or up to ~40 in a mind map.
 3. Write a spec JSON in the scratchpad, then `create <spec.json> "<vault>/<Folder>/<Name>.excalidraw.md"`.
    Default location: the same folder as the source note; default name: the topic, e.g. `Booking Flow.excalidraw.md`.
-4. Run `read` on the result and check every intended node and edge is there.
+4. **Look at it:** `render <file>` and Read the PNG, then fix and re-render until clean (excalidraw-design step 4).
+   Also run `read` to confirm every intended node and edge is there.
 5. Offer to embed it in the source note with `![[<Name>.excalidraw]]`, then `open <file>` to show it in Obsidian.
 
 Spec:
@@ -57,6 +61,9 @@ Spec:
 - Edge options: `style` solid/dashed/dotted, `both: true` for a two-way arrow, `arrow: false` for a plain line.
 - Layout is automatic in layers along `direction` (LR = left to right, TB = top to bottom). Set the same `rank`
   on nodes to stack them in one column/row (e.g. all services rank 2), or give `x`/`y` to place a node exactly.
+- Mind maps: `"layout": "mindmap", "root": "<centre id>"` and edges from parent to child. Branches are split
+  between both sides, each column gets one width, and lines have no arrowheads. Give the root a bigger `fontSize`
+  (30) and `width`/`height`, branches `fontSize` 22, and leaves 16. Each branch gets its own `color`, shared by its children.
 - `link: "[[Note]]"` makes the box clickable in Obsidian, opening that note. Use it to tie diagrams to notes.
 
 Conventions (keep them consistent across the vault): green = users/clients, yellow = gateways/edge/load balancers,
