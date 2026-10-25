@@ -1,0 +1,14 @@
+{
+  "name": "obsidian-kit",
+  "description": "Obsidian notes and Excalidraw diagram skills for Claude Code.",
+  "owner": {
+    "name": "Vivek Kumar"
+  },
+  "plugins": [
+    {
+      "name": "obsidian-kit",
+      "source": ".",
+      "description": "Write and organise Obsidian notes; create, read and edit Excalidraw diagrams in your vault."
+    }
+  ]
+}

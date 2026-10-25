@@ -1,0 +1,10 @@
+{
+  "name": "obsidian-kit",
+  "description": "Let Claude Code write and organise Obsidian notes and create, read and edit Excalidraw diagrams in your vault.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Vivek Kumar"
+  },
+  "license": "MIT",
+  "keywords": ["obsidian", "excalidraw", "notes", "diagrams", "architecture"]
+}

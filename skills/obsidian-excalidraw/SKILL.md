@@ -1,0 +1,83 @@
+---
+name: obsidian-excalidraw
+description: Create, read, explain and edit Excalidraw drawings (.excalidraw.md) in the user's Obsidian vault — architecture diagrams, HLDs, flowcharts, boxes-and-arrows. Use whenever the user asks for a diagram/drawing/architecture/flow "in Obsidian" or "in Excalidraw", asks to draw a note's content, or asks what an existing .excalidraw.md drawing shows or to change it.
+---
+
+# Excalidraw drawings in Obsidian
+
+Needs the Obsidian **Excalidraw** community plugin (by Zsolt Viczian) in the vault, and Node.js.
+To find the vault, follow "Find the vault first" in the obsidian-notes skill
+(`node "${CLAUDE_PLUGIN_ROOT}/skills/obsidian-notes/scripts/obsidian.js" vaults`).
+
+Tool: `node "${CLAUDE_SKILL_DIR}/scripts/excalidraw.js"` (run it with no args for full usage).
+
+**Never Edit the ```json / ```compressed-json block of a drawing by hand.** Drawings are often stored compressed,
+and the plugin also keeps every text in a `## Text Elements` section that must match the JSON.
+Always go through the tool, which handles both, plus arrow bindings and z-order.
+
+## Read / explain a drawing
+- `read <file>` → boxes with labels and ids, what is inside what, every arrow as `A --> B` with its label, free text.
+  This is usually enough to explain or reason about a diagram.
+- `read <file> --json` → the full scene (exact coordinates, colours) when you need precise detail.
+- Arrows marked `(near, unbound)` were drawn next to a box without snapping to it; treat them as connected.
+
+## Create a diagram
+1. Get the content: read the note(s) the user points at ("based on this") or use the conversation.
+2. Design before drawing: list the **components** (nodes), the **interactions** (edges, labelled with the verb,
+   protocol or event), and the **boundaries** (groups: VPC, "Backend services", a bounded context).
+   Aim for 4–15 nodes; split bigger systems into several diagrams or levels.
+3. Write a spec JSON in the scratchpad, then `create <spec.json> "<vault>/<Folder>/<Name>.excalidraw.md"`.
+   Default location: the same folder as the source note; default name: the topic, e.g. `Booking Flow.excalidraw.md`.
+4. Run `read` on the result and check every intended node and edge is there.
+5. Offer to embed it in the source note with `![[<Name>.excalidraw]]`, then `open <file>` to show it in Obsidian.
+
+Spec:
+```json
+{
+  "title": "Flight Booking - HLD",
+  "direction": "LR",
+  "nodes": [
+    { "id": "client", "label": "Client\n(Web / Mobile)", "color": "green" },
+    { "id": "gw", "label": "API Gateway", "color": "yellow", "link": "[[API Gateway]]" },
+    { "id": "flight", "label": "Flight Service", "color": "blue", "rank": 2 },
+    { "id": "db", "label": "Flights DB", "shape": "ellipse", "color": "orange" },
+    { "id": "mq", "label": "Kafka", "shape": "diamond", "color": "purple" }
+  ],
+  "edges": [
+    { "from": "client", "to": "gw", "label": "HTTPS" },
+    { "from": "gw", "to": "flight", "label": "/flights" },
+    { "from": "flight", "to": "db" },
+    { "from": "flight", "to": "mq", "label": "seat.held", "style": "dashed" }
+  ],
+  "groups": [{ "label": "Backend", "nodes": ["flight", "db"] }],
+  "notes": [{ "text": "JWT checked here", "near": "gw", "side": "below" }]
+}
+```
+- `shape`: rectangle (default), ellipse, diamond. `color`: blue, green, yellow, red, orange, purple, pink, teal, gray, white, or hex.
+- Edge options: `style` solid/dashed/dotted, `both: true` for a two-way arrow, `arrow: false` for a plain line.
+- Layout is automatic in layers along `direction` (LR = left to right, TB = top to bottom). Set the same `rank`
+  on nodes to stack them in one column/row (e.g. all services rank 2), or give `x`/`y` to place a node exactly.
+- `link: "[[Note]]"` makes the box clickable in Obsidian, opening that note. Use it to tie diagrams to notes.
+
+Conventions (keep them consistent across the vault): green = users/clients, yellow = gateways/edge/load balancers,
+blue = services, orange ellipse = databases/caches/storage, purple diamond = queues/topics/events,
+red = external or third-party systems and security concerns, gray = infrastructure. Request flows go LR;
+hierarchies and pipelines go TB. Labels are short (≤ 3 words, use `\n` for a second line). Async = dashed.
+
+## Change an existing drawing
+- **Add** boxes/arrows: `add <file> <spec.json>` (new content goes to the right; `--below` or `--at X,Y` to choose).
+  Edge `from`/`to` can name existing shapes by **id or exact label**, e.g. `{ "from": "Execution Service", "to": "queue" }`.
+- **Rename, recolour, move, delete**: `read <file> --json > scene.json` (scratchpad), edit scene.json, then `write <file> scene.json`.
+  - Rename: change the text element's `text` (the tool syncs `originalText` and the Text Elements section).
+  - Recolour: `backgroundColor` / `strokeColor` on the shape.
+  - Move: shift the shape and its bound text (`containerId` = shape id) by the same dx/dy, then `write ... --reroute`
+    so straight arrows follow.
+  - Delete: remove the shape, its bound text and its arrows; dangling references are cleaned up automatically.
+- Ask the user to close or save the drawing in Obsidian first if they are editing it right now. The plugin reloads
+  the file when it changes, and unsaved edits in the open view could conflict.
+
+## Notes
+- New drawings follow the vault's "Compress Excalidraw JSON" setting, and existing ones keep the format they had;
+  `compress`/`decompress` switch a file. The plugin regenerates PNG/SVG exports next time the drawing is saved in Obsidian.
+- Arrows are straight lines. For crowded diagrams, use `rank`, `x`/`y`, or split the diagram rather than accept crossings.
+- Embedded images and freehand strokes in existing drawings are preserved but not editable through specs.
