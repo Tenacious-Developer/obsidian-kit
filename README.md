@@ -20,7 +20,7 @@ reads and writes the Excalidraw plugin's `.excalidraw.md` format, including comp
 In a terminal:
 
 ```
-claude plugin marketplace add <github-username>/obsidian-kit
+claude plugin marketplace add Tenacious-Developer/obsidian-kit
 claude plugin install obsidian-kit@obsidian-kit
 ```
 

@@ -5,6 +5,8 @@
   "author": {
     "name": "Vivek Kumar"
   },
+  "homepage": "https://github.com/Tenacious-Developer/obsidian-kit",
+  "repository": "https://github.com/Tenacious-Developer/obsidian-kit",
   "license": "MIT",
   "keywords": ["obsidian", "excalidraw", "notes", "diagrams", "architecture"]
 }
