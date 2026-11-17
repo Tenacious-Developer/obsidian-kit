@@ -1,6 +1,6 @@
 ---
 name: obsidian-excalidraw
-description: Create, read, explain and edit Excalidraw drawings (.excalidraw.md) in the user's Obsidian vault — architecture diagrams, HLDs, flowcharts, boxes-and-arrows. Use whenever the user asks for a diagram/drawing/architecture/flow "in Obsidian" or "in Excalidraw", asks to draw a note's content, or asks what an existing .excalidraw.md drawing shows or to change it.
+description: Create, read, explain and edit Excalidraw drawings (.excalidraw.md) in the user's Obsidian vault — architecture diagrams, HLDs, flowcharts, boxes-and-arrows, with technology logos, AWS/cloud service icons and images. Use whenever the user asks for a diagram/drawing/architecture/flow "in Obsidian" or "in Excalidraw", asks to draw a note's content, or asks what an existing .excalidraw.md drawing shows or to change it.
 ---
 
 # Excalidraw drawings in Obsidian
@@ -66,6 +66,21 @@ Spec:
   (30) and `width`/`height`, branches `fontSize` 22, and leaves 16. Each branch gets its own `color`, shared by its children.
 - `link: "[[Note]]"` makes the box clickable in Obsidian, opening that note. Use it to tie diagrams to notes.
 
+## Icons and images
+A node with `icon` or `image` is drawn as the picture with its label underneath: borderless unless the node has a
+`color`, grouped so it moves as one, and arrows still connect to it like any box. The files are saved in the
+vault (`<Excalidraw folder>/icons/<set>/`, web images in `<Excalidraw folder>/images/`), so drawings work offline.
+- `"icon": "redis"`: a bare name tries Devicon (colour logos), then Simple Icons (~3,400 brands in their brand colour).
+  Force one with `devicon:<name>` or `si:<name>`. Use the names `icons search <words>` prints; don't guess.
+- `"icon": "aws:lambda"`: official AWS Architecture Icons (~800). The first `aws:` icon downloads AWS's own package
+  (~15 MB, a few seconds) into the vault; nothing to set up. Short names work: `aws:s3`, `aws:sqs`, `aws:ecs`,
+  `aws:alb`, `aws:vpc`, `aws:api-gateway`. Other packs (Azure, GCP, a company's own) are imported from a zip or folder
+  the user downloaded: `icons import "<zip>" --vault "<vault>"` (Azure is detected; others take `--set gcp` etc.).
+- `"icon": "[[my-logo.svg]]"` uses any image already in the vault. `iconSize` (default 64) sets its size.
+- `"image": "[[checkout.png]]"` shows a picture (screenshot, mockup) at `imageWidth` (default 240). A `https://` URL is
+  downloaded into the vault first. Use only images the user provided or pointed you to, never random web images.
+- The `shape` option is ignored on icon nodes. Keep groups (VPC, region, "Backend") as plain dashed boxes around them.
+
 Conventions (keep them consistent across the vault): green = users/clients, yellow = gateways/edge/load balancers,
 blue = services, orange ellipse = databases/caches/storage, purple diamond = queues/topics/events,
 red = external or third-party systems and security concerns, gray = infrastructure. Request flows go LR;
@@ -78,8 +93,10 @@ hierarchies and pipelines go TB. Labels are short (≤ 3 words, use `\n` for a s
   - Rename: change the text element's `text` (the tool syncs `originalText` and the Text Elements section).
   - Recolour: `backgroundColor` / `strokeColor` on the shape.
   - Move: shift the shape and its bound text (`containerId` = shape id) by the same dx/dy, then `write ... --reroute`
-    so straight arrows follow.
-  - Delete: remove the shape, its bound text and its arrows; dangling references are cleaned up automatically.
+    so straight arrows follow. For an icon node, also shift the `image` element in the same group (`groupIds`).
+  - Delete: remove the shape, its bound text and its arrows (and, for an icon node, the `image` in its group);
+    dangling references and unused Embedded Files entries are cleaned up automatically.
+  - Swap an icon: easiest is to delete the node and `add` it again with the new `icon`.
 - Ask the user to close or save the drawing in Obsidian first if they are editing it right now. The plugin reloads
   the file when it changes, and unsaved edits in the open view could conflict.
 
@@ -87,4 +104,6 @@ hierarchies and pipelines go TB. Labels are short (≤ 3 words, use `\n` for a s
 - New drawings follow the vault's "Compress Excalidraw JSON" setting, and existing ones keep the format they had;
   `compress`/`decompress` switch a file. The plugin regenerates PNG/SVG exports next time the drawing is saved in Obsidian.
 - Arrows are straight lines. For crowded diagrams, use `rank`, `x`/`y`, or split the diagram rather than accept crossings.
-- Embedded images and freehand strokes in existing drawings are preserved but not editable through specs.
+- Images are stored the plugin's way: an `image` element whose `fileId` is listed in the `## Embedded Files` section
+  as `<fileId>: [[path]]`. `read` shows them as `icon <path>` on their node, or `file <path>` for a standalone image;
+  `render` loads them from the vault. Freehand strokes in existing drawings are preserved but not editable through specs.

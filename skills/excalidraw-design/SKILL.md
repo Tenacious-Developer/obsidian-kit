@@ -39,6 +39,12 @@ Avoid uniform grids of identical boxes. When a diagram has several sections, giv
   For technical diagrams add one concrete example as a note (an endpoint, an event payload, a command).
 - **Every relationship is a line.** Being next to each other doesn't mean connected. Label arrows with a verb or protocol.
 - **Clickable:** set `link: "[[Note#Heading]]"` on boxes so the diagram opens the notes behind it.
+- **Icons when they name a real product:** in architecture diagrams and HLDs, give every concrete technology its
+  icon (`aws:lambda`, `redis`, `postgresql`, `si:stripe`) and keep the label for its *role* ("Session Cache", not
+  "Redis"). Use icons on all nodes of a diagram or none of them, never a few. Concepts without a product (a "Pricing rule",
+  a mind-map branch) stay as coloured boxes. Group boxes (VPC, region, tiers) carry the structure, and the icons carry the identity.
+- **Images only when they show something words can't:** a UI screenshot next to the service that serves it, a
+  hardware photo. One or two per diagram, sized smaller than the flow (`imageWidth` 160–240).
 
 ## 4. Render, look, fix (mandatory)
 1. `render <file>` → prints the PNG path. **Read the PNG** to see it.
@@ -48,6 +54,7 @@ Avoid uniform grids of identical boxes. When a diagram has several sections, giv
    - Lines crossing boxes or text, or arrows pointing at the wrong thing?
    - Crowded corners next to empty areas; uneven gaps; misaligned columns?
    - Anything too small to read at normal zoom?
+   - Icons: the right logo on each node, none missing (an empty box means the file wasn't found), similar sizes?
 3. Fix through the spec (sizes, `rank`, `spacing`, `x`/`y`, shorter labels) and re-create with `--force`, or edit the
    scene and `write`. Then render again.
 4. Repeat until a round finds nothing to fix. That usually takes 2–4 rounds. Anything you notice is something to fix,

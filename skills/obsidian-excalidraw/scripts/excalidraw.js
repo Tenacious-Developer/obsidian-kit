@@ -4,7 +4,10 @@
 "use strict";
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
+const crypto = require("crypto");
+const zlib = require("zlib");
 const { execFile } = require("child_process");
 // Bundled so the kit runs with no npm install.
 const LZString = require("./vendor/lz-string.js");
@@ -62,15 +65,24 @@ const USAGE = `Usage: node excalidraw.js <command> ...
   compress <file> | decompress <file>
                                    Switch a drawing's storage between compressed and plain JSON.
   open <file>                      Open any vault file in the Obsidian app.
+  icons search <words> [--vault V] Find icon names: devicon:<name>, si:<name> (Simple Icons) and imported
+                                   sets such as aws:<name>.
+  icons import aws | <zip|folder> [--set NAME] [--vault V]
+                                   Copy an icon pack into the vault as the set NAME (guessed for AWS and
+                                   Azure packs). "aws" downloads AWS's official package, which also
+                                   happens automatically the first time an aws: icon is used.
 
 Spec: { "title", "direction": "LR"|"TB", "layout": "layers"|"mindmap", "root" (mindmap centre id),
         "nodes":  [{ "id", "label", "shape": "rectangle"|"ellipse"|"diamond", "color",
-                     "stroke", "style", "rank", "x", "y", "width", "height", "fontSize", "link" }],
+                     "stroke", "style", "rank", "x", "y", "width", "height", "fontSize", "link",
+                     "icon": "aws:lambda"|"redis"|"[[file.svg]]", "iconSize",
+                     "image": "[[file.png]]"|"https://...", "imageWidth" }],
         "edges":  [{ "from", "to", "label", "style": "solid"|"dashed"|"dotted", "both", "arrow", "color" }],
         "groups": [{ "label", "nodes": [ids], "color", "style" }],
         "notes":  [{ "text", "near", "side": "below"|"above"|"left"|"right", "x", "y", "fontSize" }],
         "spacing": { "rank", "node" } }
-Colors: ${Object.keys(COLORS).join(", ")} or any hex.`;
+Colors: ${Object.keys(COLORS).join(", ")} or any hex.
+A node with an icon or image draws the picture with its label underneath, borderless unless it has a color.`;
 
 // ---------- small helpers ----------
 
@@ -129,7 +141,8 @@ function baseElement(type, props) {
 function measure(text, fontSize) {
   const lines = String(text).split("\n");
   return {
-    width: Math.max(...lines.map((l) => l.length)) * fontSize * CHAR_WIDTH,
+    // capitals are much wider than the average glyph; underestimating them lets arrows run through labels
+    width: Math.max(...lines.map((l) => l.length + (l.match(/[A-Z]/g) || []).length * 0.35)) * fontSize * CHAR_WIDTH,
     height: lines.length * fontSize * LINE_HEIGHT,
   };
 }
@@ -206,6 +219,317 @@ function arrowBetween(a, b, e) {
   return arrow;
 }
 
+// ---------- images and icons ----------
+
+// Pinned so the same name always gives the same icon. Downloads are cached in the vault, indexes in ~/.cache.
+// AWS lets people use its icons in diagrams but not redistribute them, so the kit downloads AWS's own package
+// on first use instead of bundling it. The page links the current quarterly release; the pinned URL is a fallback.
+const AWS_ICONS_PAGE = "https://aws.amazon.com/architecture/icons/";
+const AWS_ICONS_ZIP = "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip";
+const SIMPLE_ICONS = "https://cdn.jsdelivr.net/npm/simple-icons@16.38.0";
+const DEVICON = "https://cdn.jsdelivr.net/gh/devicons/devicon@2.18.0";
+const CACHE_DIR = path.join(os.homedir(), ".cache", "obsidian-kit");
+const ICON_SIZE = 64;
+const MEDIA_PAD = 12;
+const MEDIA_FONT = 18;
+const BOUND_TEXT_PAD = 5; // Excalidraw's padding around text inside a container
+const MIME = { svg: "image/svg+xml", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
+// Short names people use for cloud services, mapped to the slugs an imported pack gives them.
+const ICON_ALIASES = {
+  s3: "simple-storage-service", sqs: "simple-queue-service", sns: "simple-notification-service",
+  ecs: "elastic-container-service", eks: "elastic-kubernetes-service", ecr: "elastic-container-registry",
+  elb: "elastic-load-balancing", alb: "elastic-load-balancing-application-load-balancer",
+  nlb: "elastic-load-balancing-network-load-balancer", ebs: "elastic-block-store",
+  iam: "identity-and-access-management", apigateway: "api-gateway", vpc: "virtual-private-cloud",
+};
+
+const slugify = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+const compact = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
+const extOf = (f) => path.extname(f).slice(1).toLowerCase();
+const toPosix = (p) => p.split(path.sep).join("/");
+
+async function download(url) {
+  let res;
+  try { res = await fetch(url); } catch (e) { fail(`could not download ${url} (${e.cause?.code || e.message}); icons and web images need internet access`); }
+  if (!res.ok) fail(`could not download ${url} (HTTP ${res.status})`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+async function cachedJson(name, url) {
+  const file = path.join(CACHE_DIR, name);
+  if (!fs.existsSync(file)) {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(file, await download(url));
+  }
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+const simpleIcons = async () => {
+  const j = await cachedJson("simple-icons-16.38.0.json", `${SIMPLE_ICONS}/data/simple-icons.json`);
+  return Array.isArray(j) ? j : j.icons;
+};
+const devicons = () => cachedJson("devicon-2.18.0.json", `${DEVICON}/devicon.json`);
+
+// The plugin's "Excalidraw folder" setting; icons and downloaded images go under it.
+function excalidrawFolder(vault) {
+  try {
+    const s = JSON.parse(fs.readFileSync(path.join(vault, ".obsidian", "plugins", "obsidian-excalidraw-plugin", "data.json"), "utf8"));
+    if (s.folder) return s.folder.replace(/^\/+|\/+$/g, "");
+  } catch {}
+  return "Excalidraw";
+}
+
+function vaultFiles(vault, dir = "") {
+  const out = [];
+  for (const e of fs.readdirSync(path.join(vault, dir), { withFileTypes: true })) {
+    if (e.name.startsWith(".")) continue;
+    const rel = dir ? `${dir}/${e.name}` : e.name;
+    if (e.isDirectory()) out.push(...vaultFiles(vault, rel));
+    else out.push(rel);
+  }
+  return out;
+}
+
+// Resolve a [[link]] or path the way Obsidian does: exact vault path, then next to the drawing, then by file name.
+function resolveVaultLink(vault, link, fromDir = "") {
+  const p = String(link).replace(/^!?\[\[/, "").replace(/\]\].*$/, "").split("|")[0].split("#")[0].trim().replace(/\\/g, "/");
+  for (const cand of [p, fromDir && `${fromDir}/${p}`]) if (cand && fs.existsSync(path.join(vault, cand))) return path.posix.normalize(cand);
+  const hits = vaultFiles(vault).filter((f) => f.endsWith("/" + p) || path.posix.basename(f) === path.posix.basename(p));
+  return hits.sort((a, b) => a.length - b.length)[0] || null;
+}
+
+// Best match for a name among an imported set's slugs: exact, alias, then the shortest slug containing it.
+function matchSlug(slugs, name) {
+  const key = slugify(name), alias = ICON_ALIASES[compact(name)];
+  return slugs.find((s) => s === key) || (alias && slugs.find((s) => s === alias))
+    || slugs.filter((s) => `-${s}-`.includes(`-${key}-`)).sort((a, b) => a.length - b.length)[0]
+    || slugs.filter((s) => s.includes(key)).sort((a, b) => a.length - b.length)[0];
+}
+
+// Exact name first, then (for 4+ letters) the shortest name containing it, so "kafka" finds apachekafka.
+const partial = (list, key, field) => (key.length >= 4 ? list.filter((x) => x[field].includes(key)).sort((a, b) => a[field].length - b[field].length)[0] : null);
+const findDevicon = (list, name, loose) => list.find((d) => d.name === compact(name) || (d.altnames || []).includes(compact(name)))
+  || (loose ? partial(list, compact(name), "name") : null);
+const findSimpleIcon = (list, name, loose) => list.find((i) => i.slug === compact(name) || compact(i.title) === compact(name)
+  || (i.aliases?.aka || []).some((a) => compact(a) === compact(name))) || (loose ? partial(list, compact(name), "slug") : null);
+
+// Turn an icon reference into a file in the vault, downloading it on first use. Returns its vault path.
+async function iconFile(vault, ref, fromDir) {
+  if (/^!?\[\[/.test(ref) || /\.(svg|png|jpe?g|gif|webp)$/i.test(ref)) {
+    return resolveVaultLink(vault, ref, fromDir) || fail(`icon ${ref} not found in the vault`);
+  }
+  const m = ref.match(/^(?:([\w-]+):)?(.+)$/);
+  const set = m[1] && m[1].toLowerCase(), name = m[2].trim();
+  const dir = `${excalidrawFolder(vault)}/icons`;
+  const save = async (rel, url, edit = (b) => b) => {
+    const abs = path.join(vault, rel);
+    if (!fs.existsSync(abs)) {
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, edit(await download(url)));
+    }
+    return rel;
+  };
+
+  if (set && set !== "devicon" && set !== "si") {
+    const setDir = path.join(vault, dir, set);
+    if (set === "aws" && !(fs.existsSync(setDir) && fs.readdirSync(setDir).length)) await importIcons(vault, await awsPackage(), "aws");
+    const files = fs.existsSync(setDir) ? fs.readdirSync(setDir) : [];
+    if (!files.length) fail(`no "${set}" icons in ${dir}/${set}. Import the pack first: icons import <zip or folder> --set ${set}`);
+    const slug = matchSlug(files.map((f) => f.replace(/\.\w+$/, "")), name)
+      || fail(`no "${set}" icon matches "${name}"; try: icons search ${name}`);
+    return `${dir}/${set}/${files.find((f) => f.replace(/\.\w+$/, "") === slug)}`;
+  }
+  // A bare name prefers Devicon's colour logos, then Simple Icons; exact names win over partial ones.
+  const dev = set === "si" ? [] : await devicons(), si = set === "devicon" ? [] : await simpleIcons();
+  const d = findDevicon(dev, name) || (!findSimpleIcon(si, name) && findDevicon(dev, name, true));
+  if (d) {
+    const svg = d.versions?.svg || [];
+    const v = ["original", "plain"].find((x) => svg.includes(x)) || svg[0];
+    return save(`${dir}/devicon/${d.name}.svg`, `${DEVICON}/icons/${d.name}/${d.name}-${v}.svg`);
+  }
+  const s = findSimpleIcon(si, name, true) || fail(`no ${set ? set + " " : ""}icon named "${name}"; try: icons search ${name}`);
+  // Simple Icons are single-colour paths; fill them with the brand colour.
+  return save(`${dir}/si/${s.slug}.svg`, `${SIMPLE_ICONS}/icons/${s.slug}.svg`,
+    (b) => Buffer.from(b.toString("utf8").replace(/<svg\b(?![^>]*\bfill=)/, `<svg fill="#${s.hex}"`)));
+}
+
+// A node's picture: a vault file, or a web image saved into the vault so the drawing works offline.
+async function imageFile(vault, ref, fromDir) {
+  if (!/^https?:\/\//i.test(ref)) return resolveVaultLink(vault, ref, fromDir) || fail(`image ${ref} not found in the vault`);
+  const name = decodeURIComponent(new URL(ref).pathname.split("/").pop() || "image").replace(/[\\/:*?"<>|#^[\]]/g, "-");
+  const rel = `${excalidrawFolder(vault)}/images/${MIME[extOf(name)] ? name : name + ".png"}`;
+  if (!fs.existsSync(path.join(vault, rel))) {
+    fs.mkdirSync(path.dirname(path.join(vault, rel)), { recursive: true });
+    fs.writeFileSync(path.join(vault, rel), await download(ref));
+  }
+  return rel;
+}
+
+// Natural size of an image from its header, so pictures keep their proportions.
+function imageSize(buf, ext) {
+  try {
+    if (ext === "png") return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+    if (ext === "gif") return { w: buf.readUInt16LE(6), h: buf.readUInt16LE(8) };
+    if (ext === "jpg" || ext === "jpeg") {
+      for (let p = 2; p + 9 < buf.length && buf[p] === 0xff; p += 2 + buf.readUInt16BE(p + 2)) {
+        const m = buf[p + 1];
+        if (m >= 0xc0 && m <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(m)) return { w: buf.readUInt16BE(p + 7), h: buf.readUInt16BE(p + 5) };
+      }
+    }
+    if (ext === "webp") {
+      const kind = buf.toString("ascii", 12, 16);
+      if (kind === "VP8X") return { w: 1 + buf.readUIntLE(24, 3), h: 1 + buf.readUIntLE(27, 3) };
+      if (kind === "VP8L") { const b = buf.readUInt32LE(21); return { w: (b & 0x3fff) + 1, h: ((b >> 14) & 0x3fff) + 1 }; }
+      if (kind === "VP8 ") return { w: buf.readUInt16LE(26) & 0x3fff, h: buf.readUInt16LE(28) & 0x3fff };
+    }
+    if (ext === "svg") {
+      const tag = buf.toString("utf8").match(/<svg\b[^>]*>/i)?.[0] || "";
+      const vb = tag.match(/viewBox\s*=\s*["']([^"']+)["']/i)?.[1].trim().split(/[\s,]+/).map(Number);
+      const attr = (a) => Number(tag.match(new RegExp(`\\s${a}\\s*=\\s*["']([\\d.]+)(px)?["']`, "i"))?.[1]);
+      const w = attr("width") || vb?.[2], h = attr("height") || vb?.[3];
+      if (w > 0 && h > 0) return { w, h };
+    }
+  } catch {}
+  return { w: 1, h: 1 };
+}
+
+// Resolve every icon/image node to a vault file and its drawn size (n._media). Returns { fileId: "[[path]]" }
+// for the drawing's Embedded Files section.
+async function prepareMedia(spec, drawingFile) {
+  const media = (spec.nodes || []).filter((n) => n.icon || n.image);
+  if (!media.length) return {};
+  const vault = findVault(drawingFile) || fail("icons and images need the drawing to be inside an Obsidian vault");
+  const fromDir = toPosix(path.relative(vault, path.dirname(path.resolve(drawingFile))));
+  const embeds = {};
+  for (const n of media) {
+    const rel = n.icon ? await iconFile(vault, String(n.icon), fromDir) : await imageFile(vault, String(n.image), fromDir);
+    if (!MIME[extOf(rel)]) fail(`node "${n.id}": ${rel} is not an image (svg, png, jpg, gif or webp)`);
+    const buf = fs.readFileSync(path.join(vault, rel));
+    const size = imageSize(buf, extOf(rel));
+    const box = n.icon ? n.iconSize || ICON_SIZE : n.imageWidth || 240;
+    let k = Math.min(box / size.w, (n.icon ? box : box * 1.5) / size.h);
+    if (n.image && extOf(rel) !== "svg" && size.w > 1) k = Math.min(k, 1); // don't blow up small bitmaps
+    const fileId = crypto.createHash("sha1").update(buf).digest("hex");
+    n._media = { fileId, w: Math.round(size.w * k), h: Math.round(size.h * k) };
+    embeds[fileId] = `[[${rel}]]`;
+  }
+  return embeds;
+}
+
+// Image data for rendering: { mimeType, dataURL }, or null when the file can't be found.
+async function embedData(vault, link, fromDir) {
+  if (/^https?:\/\//.test(link)) {
+    const mimeType = MIME[extOf(new URL(link).pathname)] || "image/png";
+    return { mimeType, dataURL: `data:${mimeType};base64,${(await download(link)).toString("base64")}` };
+  }
+  const rel = vault && /^\[\[/.test(link) && resolveVaultLink(vault, link, fromDir);
+  if (!rel || !MIME[extOf(rel)]) return null;
+  const mimeType = MIME[extOf(rel)];
+  return { mimeType, dataURL: `data:${mimeType};base64,${fs.readFileSync(path.join(vault, rel)).toString("base64")}` };
+}
+
+// Entries of a zip file (stored or deflated, nested zips included), using only Node's zlib.
+function readZip(buf, prefix = "") {
+  let eocd = buf.length - 22;
+  while (eocd >= 0 && buf.readUInt32LE(eocd) !== 0x06054b50) eocd--;
+  if (eocd < 0) fail("not a zip file");
+  const entries = [];
+  let p = buf.readUInt32LE(eocd + 16);
+  for (let i = buf.readUInt16LE(eocd + 10); i > 0; i--) {
+    if (buf.readUInt32LE(p) !== 0x02014b50) fail("damaged zip file");
+    const method = buf.readUInt16LE(p + 10), size = buf.readUInt32LE(p + 20), local = buf.readUInt32LE(p + 42);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const name = prefix + buf.toString("utf8", p + 46, p + 46 + nameLen).replace(/\\/g, "/");
+    const data = () => {
+      const start = local + 30 + buf.readUInt16LE(local + 26) + buf.readUInt16LE(local + 28);
+      const raw = buf.subarray(start, start + size);
+      return method === 0 ? raw : method === 8 ? zlib.inflateRawSync(raw) : fail(`${name}: unsupported zip compression`);
+    };
+    if (/\.zip$/i.test(name)) entries.push(...readZip(data(), name.replace(/\.zip$/i, "") + "/"));
+    else if (!name.endsWith("/")) entries.push({ name, data });
+    p += 46 + nameLen + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32);
+  }
+  return entries;
+}
+
+// Short, stable icon names from pack file names, e.g. Arch_AWS-Lambda_64.svg -> lambda,
+// Arch_Amazon-Simple-Storage-Service_64.svg -> simple-storage-service, 10021-icon-service-Virtual-Machine.svg -> virtual-machine.
+function iconSlug(file) {
+  return slugify(path.posix.basename(file).replace(/\.\w+$/, "").replace(/@\d+x$/, "")
+    .replace(/^\d+-icon-service-/i, "").replace(/^Arch-Category_/i, "Category-").replace(/^(Arch|Res)_/i, "")
+    .replace(/_(16|32|48|64)(?=_|$)/g, "").replace(/_(Light|Dark)$/i, "").replace(/^(AWS|Amazon)-/i, ""));
+}
+
+function iconRank(file) {
+  const size = Number(file.match(/_(16|32|48|64)(?=_|\.|$)/)?.[1] || 0);
+  return size + (/\/Arch_|^Arch_/.test(file) ? 100 : 0) + (/_Dark\./i.test(file) ? -50 : 0) + (extOf(file) === "svg" ? 1000 : 0);
+}
+
+function iconVault(flags) {
+  const v = flags.vault || process.env.OBSIDIAN_VAULT || findVault(path.join(process.cwd(), "x"));
+  return v && fs.existsSync(path.join(v, ".obsidian")) ? path.resolve(v) : null;
+}
+
+// The current AWS Architecture Icons zip, as zip entries.
+async function awsPackage() {
+  let url = AWS_ICONS_ZIP;
+  try {
+    const page = (await download(AWS_ICONS_PAGE)).toString("utf8");
+    url = page.match(/https:\/\/[^"'\s]*\/Icon-package_[^"'\s]*\.zip/)?.[0] || url;
+  } catch {}
+  console.error(`downloading the AWS Architecture Icons from ${url} (one time, ~15 MB)...`);
+  return readZip(await download(url));
+}
+
+async function cmdIconsImport(src, flags) {
+  const vault = iconVault(flags) || fail("icons import needs the vault: pass --vault <path>");
+  if (src.toLowerCase() === "aws") return importIcons(vault, await awsPackage(), "aws");
+  const abs = path.resolve(src);
+  const entries = fs.statSync(abs).isDirectory()
+    ? vaultFiles(abs).map((f) => ({ name: f, data: () => fs.readFileSync(path.join(abs, f)) }))
+    : readZip(fs.readFileSync(abs));
+  importIcons(vault, entries, flags.set, path.basename(abs).replace(/\.zip$/i, ""));
+}
+
+// Copy a pack's icons into <Excalidraw folder>/icons/<set>/, one file per icon name (best size, SVG first).
+function importIcons(vault, entries, setName, fallbackName = "icons") {
+  const icons = entries.filter((e) => /\.(svg|png)$/i.test(e.name) && !/(^|\/)(__MACOSX|\.)/.test(e.name));
+  if (!icons.length) fail("no .svg or .png icons found in the pack");
+  const set = slugify(setName || (icons.some((e) => /(^|\/)Arch_/.test(e.name)) ? "aws"
+    : icons.some((e) => /icon-service-/.test(e.name)) ? "azure" : fallbackName));
+  const best = new Map();
+  for (const e of icons) {
+    const slug = iconSlug(e.name);
+    if (slug && (!best.has(slug) || iconRank(e.name) > iconRank(best.get(slug).name))) best.set(slug, e);
+  }
+  const dir = path.join(vault, excalidrawFolder(vault), "icons", set);
+  fs.mkdirSync(dir, { recursive: true });
+  for (const [slug, e] of best) fs.writeFileSync(path.join(dir, `${slug}.${extOf(e.name)}`), e.data());
+  console.log(`imported ${best.size} icons as "${set}" into ${dir}\nuse them as "icon": "${set}:<name>", e.g. ${[...best.keys()].slice(0, 3).map((s) => `${set}:${s}`).join(", ")}`);
+}
+
+async function cmdIconsSearch(words, flags) {
+  const terms = words.map(compact).filter(Boolean);
+  if (!terms.length) fail("icons search needs a word, e.g. icons search queue");
+  const hit = (...fields) => terms.every((t) => fields.some((f) => compact(f).includes(t)));
+  const out = [];
+  const vault = iconVault(flags);
+  const iconsDir = vault && path.join(vault, excalidrawFolder(vault), "icons");
+  if (iconsDir && fs.existsSync(iconsDir)) {
+    for (const set of fs.readdirSync(iconsDir).filter((s) => !["devicon", "si"].includes(s))) {
+      const slugs = fs.readdirSync(path.join(iconsDir, set)).map((f) => f.replace(/\.\w+$/, ""));
+      const alias = terms.length === 1 && ICON_ALIASES[terms[0]];
+      for (const s of slugs.filter((s) => hit(s) || s === alias).slice(0, 15)) out.push(`${set}:${s}`.padEnd(40) + "(imported)");
+    }
+  }
+  for (const d of (await devicons()).filter((d) => hit(d.name, ...(d.altnames || []), ...(d.tags || []))).slice(0, 15)) {
+    out.push(`devicon:${d.name}`.padEnd(40) + "colour logo");
+  }
+  for (const i of (await simpleIcons()).filter((i) => hit(i.slug, i.title, ...(i.aliases?.aka || []))).slice(0, 15)) {
+    out.push(`si:${i.slug}`.padEnd(40) + `${i.title} (#${i.hex})`);
+  }
+  console.log(out.length ? out.join("\n") : `no icons match "${words.join(" ")}"` + (vault ? "" : " (pass --vault to include imported sets)"));
+}
+
 // ---------- layout ----------
 
 // Layered layout: ranks from longest path along edges, barycentre ordering inside each rank,
@@ -217,11 +541,20 @@ function layoutSpec(spec) {
 
   const nodes = (spec.nodes || []).map((n, i) => {
     if (!n.id) fail(`node #${i + 1} has no "id"`);
-    const shape = n.shape || "rectangle";
+    const shape = n._media ? "rectangle" : n.shape || "rectangle";
     if (!SHAPES.includes(shape)) fail(`node "${n.id}": shape must be one of ${SHAPES.join(", ")}`);
     const label = String(n.label ?? n.id);
-    const fontSize = n.fontSize || 20;
+    const fontSize = n.fontSize || (n._media ? MEDIA_FONT : 20);
     const m = measure(label, fontSize);
+    if (n._media) {
+      // picture on top, label underneath
+      const text = label ? m.height + 8 : 0;
+      return {
+        ...n, label, shape, fontSize, order: i,
+        w: n.width || Math.ceil(Math.max(n._media.w + 2 * MEDIA_PAD, label ? m.width + 16 : 0)),
+        h: n.height || Math.ceil(MEDIA_PAD + n._media.h + text + (label ? BOUND_TEXT_PAD : MEDIA_PAD)),
+      };
+    }
     const k = shape === "rectangle" ? 1 : 1.45; // ellipses and diamonds need room around the label
     return {
       ...n, label, shape, fontSize, order: i,
@@ -415,6 +748,29 @@ function buildElements(spec, nodes, external = () => null) {
   const shapeById = new Map();
 
   for (const n of nodes) {
+    if (n._media) {
+      // A borderless box (so arrows stop at the node's edge) grouped with the picture, label at the bottom.
+      const gid = randId();
+      const shape = baseElement("rectangle", {
+        x: n.px, y: n.py, width: n.w, height: n.h, groupIds: [gid],
+        backgroundColor: color(n.color, "transparent"), strokeColor: color(n.stroke, n.color ? STROKE : "transparent"),
+        strokeStyle: n.style || "solid", roundness: { type: 3 }, link: n.link || null,
+      });
+      const img = baseElement("image", {
+        x: n.px + (n.w - n._media.w) / 2, y: n.py + MEDIA_PAD, width: n._media.w, height: n._media.h,
+        strokeColor: "transparent", groupIds: [gid], link: n.link || null,
+        fileId: n._media.fileId, status: "saved", scale: [1, 1], crop: null,
+      });
+      nodeEls.push(shape, img);
+      if (n.label) {
+        const t = boundText(shape, n.label, n.fontSize);
+        t.verticalAlign = "bottom";
+        t.y = shape.y + shape.height - t.height - BOUND_TEXT_PAD;
+        nodeEls.push(t);
+      }
+      shapeById.set(n.id, shape);
+      continue;
+    }
     const shape = baseElement(n.shape, {
       x: n.px, y: n.py, width: n.w, height: n.h,
       backgroundColor: color(n.color, "transparent"), strokeColor: color(n.stroke, STROKE),
@@ -474,14 +830,18 @@ function buildElements(spec, nodes, external = () => null) {
 function loadDrawing(file) {
   if (!fs.existsSync(file)) fail(`${file}: file not found`);
   const md = fs.readFileSync(file, "utf8");
-  if (file.endsWith(".excalidraw")) return { md: null, data: JSON.parse(md), compressed: false };
+  if (file.endsWith(".excalidraw")) return { md: null, data: JSON.parse(md), compressed: false, embeds: {} };
   const m = md.match(/```(compressed-json|json)\r?\n([\s\S]*?)```/);
   if (!m) fail(`${file}: no Excalidraw drawing block found (is it an .excalidraw.md file?)`);
   const raw = m[1] === "compressed-json" ? LZString.decompressFromBase64(m[2].replace(/\s+/g, "")) : m[2];
   if (!raw) fail(`${file}: could not decompress the drawing data`);
   const data = JSON.parse(raw);
   data.elements ||= [];
-  return { md, data, compressed: m[1] === "compressed-json" };
+  // Images live in the vault; the drawing maps each image element's fileId to a link ("<fileId>: [[path]]").
+  const embeds = {};
+  const section = md.match(/## Embedded Files\r?\n([\s\S]*?)(?=(?:%%\r?\n)?## Drawing|$)/);
+  for (const [, id, link] of section ? section[1].matchAll(/^(\w+):\s*(.+?)\s*$/gm) : []) embeds[id] = link;
+  return { md, data, compressed: m[1] === "compressed-json", embeds };
 }
 
 // Make bindings, containers and text fields agree with each other after edits.
@@ -514,18 +874,22 @@ function repair(elements) {
   return els;
 }
 
-function renderMarkdown(prevMd, data, compress) {
+function renderMarkdown(prevMd, data, compress, embeds) {
   const texts = data.elements.filter((e) => e.type === "text" && !e.isDeleted)
     .map((e) => `${e.originalText ?? e.text} ^${e.id}\n\n`).join("");
+  const used = new Set(data.elements.filter((e) => !e.isDeleted && e.fileId).map((e) => e.fileId));
+  const files = Object.entries(embeds).filter(([id]) => used.has(id)).map(([id, link]) => `${id}: ${link}\n\n`).join("");
   const block = compress
     ? "```compressed-json\n" + LZString.compressToBase64(JSON.stringify(data)).match(/.{1,256}/g).join("\n\n") + "\n```"
     : "```json\n" + JSON.stringify(data, null, "\t") + "\n```";
   let md = prevMd && /## Text Elements\r?\n/.test(prevMd) ? prevMd : EMPTY_MD;
   md = md.replace(/(## Text Elements\r?\n)([\s\S]*?)(?=\r?\n## |\r?\n?%%)/, (_, head) => head + texts);
+  md = md.replace(/## Embedded Files\r?\n[\s\S]*?(?=(?:%%\r?\n)?## Drawing)/, "");
+  if (files) md = md.replace(/(?:%%\r?\n)?## Drawing/, (m) => "## Embedded Files\n" + files + m);
   return md.replace(/```(?:compressed-json|json)\r?\n[\s\S]*?```/, () => block);
 }
 
-function saveDrawing(file, prevMd, data, compress) {
+async function saveDrawing(file, prevMd, data, compress, embeds = {}) {
   data.type = "excalidraw";
   data.version = 2;
   data.source ||= PLUGIN_SOURCE;
@@ -541,21 +905,31 @@ function saveDrawing(file, prevMd, data, compress) {
     e.updated = Date.now();
   });
   fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
-  const out = file.endsWith(".excalidraw") ? JSON.stringify(data, null, "\t") : renderMarkdown(prevMd, data, compress);
+  if (file.endsWith(".excalidraw")) {
+    // Plain Excalidraw files carry their images inline.
+    for (const e of data.elements) {
+      if (!e.fileId || data.files[e.fileId] || !embeds[e.fileId]) continue;
+      const d = await embedData(findVault(file), embeds[e.fileId]);
+      if (d) data.files[e.fileId] = { id: e.fileId, ...d, created: Date.now() };
+    }
+  }
+  const out = file.endsWith(".excalidraw") ? JSON.stringify(data, null, "\t") : renderMarkdown(prevMd, data, compress, embeds);
   fs.writeFileSync(file, out, "utf8");
 }
 
 // ---------- read summary ----------
 
-function summarize(file, data, compressed) {
+function summarize(file, data, compressed, embeds = {}) {
   const els = data.elements.filter((e) => !e.isDeleted);
   const byId = new Map(els.map((e) => [e.id, e]));
   const shapes = els.filter((e) => CONTAINER_TYPES.includes(e.type));
   const freeTexts = els.filter((e) => e.type === "text" && !e.containerId);
+  const picture = (img) => (embeds[img.fileId] || (data.files?.[img.fileId] ? "(inline image)" : "(missing image)")).replace(/^\[\[|\]\].*$/g, "");
   const label = (el) => {
     const t = (el.boundElements || []).map((b) => byId.get(b.id)).find((x) => x && x.type === "text");
     if (t) return t.originalText ?? t.text;
     if (el.name) return el.name;
+    if (el.type === "image") return path.posix.basename(picture(el));
     // a group box drawn as a rectangle with a free text label in its top band
     const inner = freeTexts.find((t) => t.x >= el.x && t.x < el.x + el.width && t.y >= el.y && t.y < el.y + 60);
     return inner ? inner.originalText ?? inner.text : null;
@@ -580,12 +954,20 @@ function summarize(file, data, compressed) {
   out.push(`${file}`);
   out.push(`${els.length} elements, ${compressed ? "compressed" : "plain"} JSON` + (box ? `, canvas (${r(box.minX)},${r(box.minY)}) to (${r(box.maxX)},${r(box.maxY)})` : ""));
 
+  // An image grouped with a shape that encloses it is that shape's icon, not a shape of its own.
+  const iconOf = new Map();
+  for (const img of els.filter((e) => e.type === "image")) {
+    const host = shapes.find((s) => s.type !== "image" && (s.groupIds || []).some((g) => (img.groupIds || []).includes(g)) && contains(s, img));
+    if (host) iconOf.set(host.id, img);
+  }
+  const icons = new Set([...iconOf.values()]);
   if (shapes.length) {
-    out.push("", "SHAPES (type, label [id], position, size, fill, parent, link)");
-    for (const s of shapes) {
+    out.push("", "SHAPES (type, label [id], position, size, fill, parent, icon/file, link)");
+    for (const s of shapes.filter((s) => !icons.has(s))) {
       const p = parentOf(s);
+      const pic = s.type === "image" ? s : iconOf.get(s.id);
       out.push(`  ${s.type.padEnd(9)} ${name(s)}  at ${r(s.x)},${r(s.y)}  ${r(s.width)}x${r(s.height)}  bg ${s.backgroundColor}`
-        + (p ? `  in ${name(p)}` : "") + (s.link ? `  link ${s.link}` : ""));
+        + (p ? `  in ${name(p)}` : "") + (pic ? `  ${s === pic ? "file" : "icon"} ${picture(pic)}` : "") + (s.link ? `  link ${s.link}` : ""));
     }
   }
   const arrows = els.filter((e) => e.type === "arrow" || e.type === "line");
@@ -682,21 +1064,36 @@ try {
 function inRegion(elements, region) {
   const [rx, ry, rw, rh] = region.split(",").map(Number);
   if ([rx, ry, rw, rh].some((n) => !Number.isFinite(n))) fail("--region must be X,Y,W,H");
-  const hits = new Set(elements.filter((e) => e.x < rx + rw && e.x + e.width > rx && e.y < ry + rh && e.y + e.height > ry).map((e) => e.id));
+  const inside = elements.filter((e) => e.x < rx + rw && e.x + e.width > rx && e.y < ry + rh && e.y + e.height > ry);
+  // Keep icon nodes whole: if any part of a group holding an image is in the region, take the whole group.
+  const iconGroups = new Set(elements.filter((e) => e.type === "image").flatMap((e) => e.groupIds || []));
+  const touched = new Set(inside.flatMap((e) => e.groupIds || []).filter((g) => iconGroups.has(g)));
+  const hits = new Set([...inside, ...elements.filter((e) => (e.groupIds || []).some((g) => touched.has(g)))].map((e) => e.id));
   return elements.filter((e) => hits.has(e.id) || (e.containerId && hits.has(e.containerId)));
 }
 
 async function cmdRender(file, flags) {
   if (typeof WebSocket === "undefined") fail("render needs Node.js 22 or later (for its built-in WebSocket)");
-  const { data } = loadDrawing(file);
+  const { data, embeds } = loadDrawing(file);
   let elements = data.elements.filter((e) => !e.isDeleted);
   if (flags.region) elements = inRegion(elements, flags.region);
   if (!elements.length) fail("nothing to render (no elements" + (flags.region ? " in that region)" : ")"));
 
-  const tmp = path.join(require("os").tmpdir(), "obsidian-kit-render");
+  // Obsidian keeps images as vault files; the exporter needs them inline.
+  const files = { ...(data.files || {}) };
+  const vault = findVault(file);
+  const fromDir = vault ? toPosix(path.relative(vault, path.dirname(path.resolve(file)))) : "";
+  for (const id of new Set(elements.filter((e) => e.type === "image" && e.fileId).map((e) => e.fileId))) {
+    if (files[id]) continue;
+    const d = embeds[id] && await embedData(vault, embeds[id], fromDir);
+    if (d) files[id] = { id, ...d, created: Date.now() };
+    else console.error(`warning: image ${embeds[id] || id} not found; it is drawn as an empty placeholder`);
+  }
+
+  const tmp = path.join(os.tmpdir(), "obsidian-kit-render");
   fs.mkdirSync(tmp, { recursive: true });
   const page = path.join(tmp, "page.html");
-  fs.writeFileSync(page, renderPage({ elements, appState: data.appState || {}, files: data.files || {} }), "utf8");
+  fs.writeFileSync(page, renderPage({ elements, appState: data.appState || {}, files }), "utf8");
   const out = path.resolve(flags.out || path.join(tmp, path.basename(file).replace(/\.excalidraw(\.md)?$/, "") + ".png"));
 
   const browser = require("child_process").spawn(findBrowser(), [
@@ -750,20 +1147,22 @@ async function cmdRender(file, flags) {
 
 // ---------- commands ----------
 
-function cmdCreate(specFile, outFile, flags) {
+async function cmdCreate(specFile, outFile, flags) {
   if (!outFile) fail("create needs <spec.json> <out.excalidraw.md>");
   if (!/\.excalidraw(\.md)?$/.test(outFile)) outFile += ".excalidraw.md";
   if (fs.existsSync(outFile) && !flags.force) fail(`${outFile} already exists (use --force to overwrite, or "add" to extend it)`);
   const spec = readJson(specFile);
+  const embeds = await prepareMedia(spec, outFile);
   const elements = buildElements(spec, layoutSpec(spec));
   const compress = flags.compress || (!flags.plain && vaultCompresses(outFile));
-  saveDrawing(outFile, null, { elements }, compress);
-  console.log(`created ${outFile} (${elements.length} elements)`);
+  await saveDrawing(outFile, null, { elements }, compress, embeds);
+  console.log(`created ${outFile} (${elements.length} elements` + (Object.keys(embeds).length ? `, ${Object.keys(embeds).length} images)` : ")"));
 }
 
-function cmdAdd(file, specFile, flags) {
-  const { md, data, compressed } = loadDrawing(file);
+async function cmdAdd(file, specFile, flags) {
+  const { md, data, compressed, embeds } = loadDrawing(file);
   const spec = readJson(specFile);
+  Object.assign(embeds, await prepareMedia(spec, file));
   const live = data.elements.filter((e) => !e.isDeleted);
   const shapes = live.filter((e) => CONTAINER_TYPES.includes(e.type));
   const labelOf = (s) => {
@@ -785,13 +1184,13 @@ function cmdAdd(file, specFile, flags) {
   }
   const added = buildElements(spec, nodes, external);
   data.elements.push(...added);
-  saveDrawing(file, md, data, flags.compress || (!flags.plain && compressed));
+  await saveDrawing(file, md, data, flags.compress || (!flags.plain && compressed), embeds);
   console.log(`added ${added.length} elements to ${file}`);
 }
 
-function cmdWrite(file, sceneFile, flags) {
+async function cmdWrite(file, sceneFile, flags) {
   const scene = readJson(sceneFile);
-  const prev = fs.existsSync(file) ? loadDrawing(file) : { md: null, data: {}, compressed: vaultCompresses(file) };
+  const prev = fs.existsSync(file) ? loadDrawing(file) : { md: null, data: {}, compressed: vaultCompresses(file), embeds: {} };
   const data = { ...prev.data, ...(Array.isArray(scene) ? { elements: scene } : scene) };
   if (!Array.isArray(data.elements)) fail(`${sceneFile}: expected an "elements" array`);
   const ids = new Set();
@@ -813,7 +1212,7 @@ function cmdWrite(file, sceneFile, flags) {
       if (label) [label.x, label.y] = [a.x + seg.points[1][0] / 2 - label.width / 2, a.y + seg.points[1][1] / 2 - label.height / 2];
     }
   }
-  saveDrawing(file, prev.md, data, flags.compress || (!flags.plain && prev.compressed));
+  await saveDrawing(file, prev.md, data, flags.compress || (!flags.plain && prev.compressed), prev.embeds);
   console.log(`wrote ${file} (${data.elements.filter((e) => !e.isDeleted).length} elements)`);
 }
 
@@ -831,7 +1230,7 @@ function main() {
   const args = process.argv.slice(2);
   const flags = {}, pos = [];
   for (let i = 0; i < args.length; i++) {
-    if (["--at", "--out", "--region", "--scale"].includes(args[i])) flags[args[i].slice(2)] = args[++i];
+    if (["--at", "--out", "--region", "--scale", "--set", "--vault"].includes(args[i])) flags[args[i].slice(2)] = args[++i];
     else if (args[i].startsWith("--")) flags[args[i].slice(2)] = true;
     else pos.push(args[i]);
   }
@@ -840,15 +1239,18 @@ function main() {
   if (cmd !== "create" && !a) fail(`${cmd} needs a file argument`);
 
   if (cmd === "read") {
-    const { data, compressed } = loadDrawing(a);
-    console.log(flags.json ? JSON.stringify({ ...data, elements: data.elements.filter((e) => !e.isDeleted) }, null, 1) : summarize(a, data, compressed));
-  } else if (cmd === "create") cmdCreate(a, b, flags);
-  else if (cmd === "add") cmdAdd(a, b || fail("add needs <file> <spec.json>"), flags);
-  else if (cmd === "write") cmdWrite(a, b || fail("write needs <file> <scene.json>"), flags);
+    const { data, compressed, embeds } = loadDrawing(a);
+    console.log(flags.json ? JSON.stringify({ ...data, elements: data.elements.filter((e) => !e.isDeleted) }, null, 1) : summarize(a, data, compressed, embeds));
+  } else if (cmd === "create") return cmdCreate(a, b, flags);
+  else if (cmd === "add") return cmdAdd(a, b || fail("add needs <file> <spec.json>"), flags);
+  else if (cmd === "write") return cmdWrite(a, b || fail("write needs <file> <scene.json>"), flags);
   else if (cmd === "compress" || cmd === "decompress") {
-    const { md, data } = loadDrawing(a);
-    saveDrawing(a, md, data, cmd === "compress");
-    console.log(`${cmd}ed ${a}`);
+    const { md, data, embeds } = loadDrawing(a);
+    return saveDrawing(a, md, data, cmd === "compress", embeds).then(() => console.log(`${cmd}ed ${a}`));
+  } else if (cmd === "icons") {
+    if (a === "search") return cmdIconsSearch(pos.slice(2), flags);
+    if (a === "import") return cmdIconsImport(b || fail("icons import needs <zip or folder>"), flags);
+    fail("icons needs search <words> or import <zip|folder>");
   } else if (cmd === "render") return cmdRender(a, flags);
   else if (cmd === "open") cmdOpen(a);
   else fail(`unknown command "${cmd}"\n\n${USAGE}`);
